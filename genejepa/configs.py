@@ -11,7 +11,16 @@ class ModelConfig:
     cross_attn_chunk_size: int = 32
     gene_vocab_size: int = 60_000  # filled later from datamodule
 
-    # --- masking layout ---
+    # --- Encoder selection ---
+    encoder_type: str = "perceiver"           # "perceiver" or "transformer"
+
+    # --- Transformer-specific ---
+    transformer_num_layers: int = 12
+    transformer_num_heads: int = 6
+    transformer_fixed_gene_count: int = 768  # total genes selected per cell
+    transformer_context_gene_count: int = 384 # genes for student (rest → teacher)
+
+    # --- masking layout (perceiver only) ---
     mask_ratio: float = 0.45
     num_targets: int = 1
     min_context_genes: int = 512
@@ -32,6 +41,16 @@ class ModelConfig:
     # Predictor
     predictor_depth: int = 3
     predictor_expansion_factor: int = 4
+
+    def __post_init__(self):
+        if self.encoder_type not in ("perceiver", "transformer"):
+            raise ValueError(f"encoder_type must be 'perceiver' or 'transformer', got '{self.encoder_type}'")
+        if self.encoder_type == "transformer":
+            if self.transformer_context_gene_count >= self.transformer_fixed_gene_count:
+                raise ValueError(
+                    f"transformer_context_gene_count ({self.transformer_context_gene_count}) "
+                    f"must be less than transformer_fixed_gene_count ({self.transformer_fixed_gene_count})"
+                )
 
 
 @dataclass

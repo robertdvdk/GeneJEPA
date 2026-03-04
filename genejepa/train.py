@@ -97,6 +97,7 @@ from .models import (
     GenePerceiverEncoder,
     MLPPredictor,
     GenePerceiverJEPA,
+    build_jepa_model,
 )
 
 # ==============================================================================
@@ -123,7 +124,7 @@ class JepaLightningModule(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-        self.model = GenePerceiverJEPA(model_config)
+        self.model = build_jepa_model(model_config)
         self.total_steps = total_steps
 
         # Cache for validation callback (can be disabled by setting to 0)
@@ -380,7 +381,7 @@ class JepaLightningModule(L.LightningModule):
         if len(self._validation_cache) < self.num_batches_to_cache:
             if batch["indices"].numel() > 0:
                 with torch.no_grad():
-                    embeddings = self.model.get_embedding(batch["indices"], batch["values"], batch["offsets"], use_teacher=True)
+                    embeddings = self.model.get_embedding(batch["indices"], batch["values"], batch.get("offsets", None), use_teacher=True)
                 self._validation_cache.append({"embeddings": embeddings.cpu(), "metadata": metadata})
 
         _ = batch.pop("metadata", None)

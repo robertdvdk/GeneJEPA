@@ -18,6 +18,8 @@ from typing import List
 
 import torch
 torch.set_float32_matmul_precision("high")
+import os
+os.environ["TORCH_LOGS"] = "+sdpa"
 import lightning as L
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, Callback
 from lightning.pytorch.strategies import DDPStrategy
@@ -55,10 +57,12 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--neftel-eval-every", type=int, default=5, help="Run Neftel scib-metrics every N epochs")
     parser.add_argument("--subset", type=float, default=1.0, help="Fraction of data to use (e.g. 0.1 for 10%% trial run)")
+    parser.add_argument("--encoder-type", type=str, default="transformer", choices=["perceiver", "transformer"],
+                        help="Encoder architecture: 'perceiver' (default) or 'transformer'")
     args = parser.parse_args()
 
     # --- Configs ---
-    model_config = ModelConfig()
+    model_config = ModelConfig(encoder_type=args.encoder_type)
     train_config = TrainingConfig()
     train_config.max_epochs = args.max_epochs
     train_config.learning_rate = args.lr
@@ -79,6 +83,8 @@ def main():
         val_fraction=args.val_fraction,
         seed=args.seed,
         subset_fraction=args.subset,
+        encoder_type=args.encoder_type,
+        fixed_gene_count=model_config.transformer_fixed_gene_count,
     )
     datamodule.prepare_data()
     datamodule.setup("fit")

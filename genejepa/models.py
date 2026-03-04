@@ -489,3 +489,199 @@ class GenePerceiverJEPA(nn.Module):
             emb = self.student_encoder(indices, values, offsets)
             self.student_encoder.train()
             return emb
+
+
+class GeneTransformerEncoder(nn.Module):
+    """
+    Standard Transformer encoder for fixed-length gene token sequences.
+
+    Takes dense [B, N] indices and values (not ragged format), tokenizes them,
+    runs self-attention transformer blocks, then mean-pools to [B, d].
+    No positional encoding — gene tokens are an unordered set.
+    """
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        assert config.d % config.heads_h == 0, (
+            f"Model dimension d ({config.d}) must be divisible by "
+            f"the number of heads h ({config.heads_h})."
+        )
+        self.config = config
+        self.tokenizer = scRNATokenizer(config)
+        num_layers = config.transformer_num_layers
+        num_heads = config.transformer_num_heads
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.d,
+            nhead=num_heads,
+            dim_feedforward=config.d * 4,
+            # dropout=0.1,
+            # activation="gelu",
+            # batch_first=True,
+            # norm_first=True,
+        )
+        self.transformer_blocks = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            # enable_nested_tensor=False,
+        )
+        self.final_norm = nn.LayerNorm(config.d)
+
+    def forward(self, indices: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            indices: [B, N] gene token IDs
+            values:  [B, N] normalized expression values
+        Returns:
+            [B, d] mean-pooled representation
+        """
+        B, N = indices.shape
+        if B == 0:
+            return torch.zeros(0, self.config.d, device=indices.device, dtype=self.final_norm.weight.dtype)
+
+        # Tokenize: flatten [B, N] → [B*N], run tokenizer, reshape → [B, N, d]
+        tokens = self.tokenizer(indices.reshape(-1), values.reshape(-1))
+        tokens = tokens.view(B, N, self.config.d)
+
+        # Self-attention transformer blocks (SDPA/Flash Attention enabled)
+        x = self.transformer_blocks(tokens)
+
+        x = self.final_norm(x)
+        return x.mean(dim=1)  # [B, d]
+
+
+class GeneTransformerJEPA(nn.Module):
+    """
+    JEPA model using standard Transformer encoders.
+
+    Takes dense [B, N] tensors where N = transformer_fixed_gene_count.
+    The first `transformer_context_gene_count` columns go to the student,
+    the remaining columns go to the teacher. The data pipeline shuffles
+    gene order so this split is random.
+    """
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.student_encoder = GeneTransformerEncoder(config)
+
+        self.teacher_encoder = EMA(
+            self.student_encoder,
+            beta=config.ema_start_decay,
+            update_every=1,
+            update_after_step=0,
+        )
+
+        self.predictor = MLPPredictor(config)
+        self.teacher_encoder.ema_model.eval()
+
+    def update_teacher(self):
+        self.teacher_encoder.update()
+
+    def forward(
+        self, indices: torch.Tensor, values: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            indices: [B, N] dense gene IDs (N = fixed_gene_count)
+            values:  [B, N] dense normalized expression values
+        Returns:
+            (predicted_representations, target_representations, student_representations)
+        """
+        device = indices.device
+        if indices.numel() == 0:
+            empty = torch.empty(0, self.config.d, device=device)
+            return empty, empty, empty
+
+        ctx_n = self.config.transformer_context_gene_count
+
+        # Split: student gets [:ctx_n], teacher gets [ctx_n:]
+        ctx_indices, tgt_indices = indices[:, :ctx_n], indices[:, ctx_n:]
+        ctx_values, tgt_values = values[:, :ctx_n], values[:, ctx_n:]
+
+        # Student on context
+        student_representations = self.student_encoder(ctx_indices, ctx_values)
+        predicted_representations = self.predictor(student_representations)
+
+        # Teacher on targets
+        with torch.no_grad():
+            self.teacher_encoder.ema_model.eval()
+            target_representations = self.teacher_encoder.ema_model(tgt_indices, tgt_values)
+
+        # Debug: teacher dispersion
+        try:
+            t = target_representations.float()
+            n = t.shape[0]
+            if n > 0:
+                if n > 512:
+                    idx = torch.randperm(n, device=t.device)[:512]
+                    t = t.index_select(0, idx)
+                norms = torch.linalg.norm(t, dim=1)
+                std_norm = norms.std(unbiased=False)
+                tN = F.normalize(t, dim=1, eps=1e-6)
+                if tN.shape[0] > 1:
+                    sims = tN @ tN.T
+                    avg_cos = (sims.sum() - tN.shape[0]) / (tN.shape[0] * (tN.shape[0] - 1))
+                else:
+                    avg_cos = torch.tensor(0.0, device=t.device)
+                if hasattr(self, "_debug_cache"):
+                    self._debug_cache["teacher_avg_cos_targets"] = avg_cos.detach().cpu()
+                    self._debug_cache["teacher_stdnorm_targets"] = std_norm.detach().cpu()
+        except Exception:
+            pass
+
+        return predicted_representations, target_representations, student_representations
+
+    @torch.no_grad()
+    def get_embedding(
+        self,
+        indices: torch.Tensor,
+        values: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        use_teacher: bool = True,
+    ) -> torch.Tensor:
+        """
+        Returns per-sample embeddings. Accepts both dense [B, N] and ragged formats.
+
+        For ragged inputs (with offsets), converts to dense by padding/truncating
+        to transformer_fixed_gene_count. For dense inputs, uses them directly
+        (encodes the full sequence, not just the context split).
+        """
+        # Detect ragged vs dense input
+        if offsets is not None and indices.dim() == 1:
+            # Convert ragged → dense
+            N = self.config.transformer_fixed_gene_count
+            B = len(offsets) - 1
+            dense_indices = torch.zeros(B, N, dtype=indices.dtype, device=indices.device)
+            dense_values = torch.zeros(B, N, dtype=values.dtype, device=values.device)
+            lengths = (offsets[1:] - offsets[:-1]).tolist()
+            for i in range(B):
+                s = int(offsets[i].item())
+                L = lengths[i]
+                take = min(L, N)
+                dense_indices[i, :take] = indices[s:s + take]
+                dense_values[i, :take] = values[s:s + take]
+            indices, values = dense_indices, dense_values
+
+        encoder = (
+            self.teacher_encoder.ema_model if use_teacher
+            else self.student_encoder
+        )
+        if use_teacher:
+            encoder.eval()
+        else:
+            self.student_encoder.eval()
+
+        emb = encoder(indices, values)
+
+        if not use_teacher:
+            self.student_encoder.train()
+
+        return emb
+
+
+def build_jepa_model(config: ModelConfig) -> nn.Module:
+    """Factory function returning either GenePerceiverJEPA or GeneTransformerJEPA."""
+    if config.encoder_type == "perceiver":
+        return GenePerceiverJEPA(config)
+    elif config.encoder_type == "transformer":
+        return GeneTransformerJEPA(config)
+    else:
+        raise ValueError(f"Unknown encoder_type: {config.encoder_type}")

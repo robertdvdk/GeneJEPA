@@ -63,27 +63,38 @@ class DatasetDir:
 class MemmapCellDataset(Dataset):
     """Returns sparse gene data per cell for ragged-tensor collation."""
 
-    def __init__(self, data_dir: str | Path):
+    def __init__(self, data_dir: str | Path, min_genes: int = 0):
         self.data_dir = DatasetDir(data_dir)
         self.memmap = SingleCellMemMapDataset(self.data_dir.memmap_path)
         with open(self.data_dir.vocab_path, "r") as f:
             self.vocab = json.load(f)
+        self.min_genes = min_genes
+        self._rng = np.random.RandomState()
 
     def __len__(self):
         return self.memmap.number_of_rows()
 
-    def __getitem__(self, idx):
+    def _load_cell(self, idx):
         exp, genes = self.memmap.get_row_padded(
             idx, return_features=True, feature_vars=["_cf_gene_id"]
         )
         gene_ids = genes[0]  # vocab token IDs
-
-        # Keep only non-zero expression genes (sparse representation)
         nonzero_mask = exp != 0
         return {
             "gene_indices": gene_ids[nonzero_mask].astype(np.int64),
             "values": exp[nonzero_mask].astype(np.float32),
         }
+
+    def __getitem__(self, idx):
+        cell = self._load_cell(idx)
+        if self.min_genes > 0:
+            max_retries = 50
+            attempt = 0
+            while len(cell["gene_indices"]) < self.min_genes and attempt < max_retries:
+                idx = self._rng.randint(0, len(self))
+                cell = self._load_cell(idx)
+                attempt += 1
+        return cell
 
 
 class MemmapDataModule(L.LightningDataModule):
@@ -103,6 +114,8 @@ class MemmapDataModule(L.LightningDataModule):
         val_fraction: float = 0.05,
         seed: int = 42,
         subset_fraction: float = 1.0,
+        encoder_type: str = "perceiver",
+        fixed_gene_count: int = 1024,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -112,6 +125,8 @@ class MemmapDataModule(L.LightningDataModule):
         self.val_fraction = val_fraction
         self.seed = seed
         self.subset_fraction = subset_fraction
+        self.encoder_type = encoder_type
+        self.fixed_gene_count = fixed_gene_count
 
         self._dataset_dir = DatasetDir(self.data_dir)
         self.stats_path = self.data_dir / "global_stats.json"
@@ -197,7 +212,8 @@ class MemmapDataModule(L.LightningDataModule):
         self._load_stats()
 
         # Create dataset and split
-        full_dataset = MemmapCellDataset(self.data_dir)
+        min_genes = self.fixed_gene_count if self.encoder_type == "transformer" else 0
+        full_dataset = MemmapCellDataset(self.data_dir, min_genes=min_genes)
         n = len(full_dataset)
         n_val = max(1, int(n * self.val_fraction))
         n_train = n - n_val
@@ -282,6 +298,61 @@ class MemmapDataModule(L.LightningDataModule):
             "metadata": [{} for _ in batch],
         }
 
+    def _collate_fn_transformer(self, batch: List[Dict]) -> Dict:
+        """Collate for transformer encoder: produces dense [B, N] tensors.
+
+        Filters cells with fewer than fixed_gene_count non-zero genes,
+        randomly selects exactly fixed_gene_count genes per cell, and
+        shuffles them so the model's column-based context/target split is random.
+        """
+        N = self.fixed_gene_count
+
+        all_indices = []
+        all_values = []
+
+        for sample in batch:
+            gene_ids = sample["gene_indices"]
+            vals = sample["values"]
+            n_genes = len(gene_ids)
+
+            if n_genes < N:
+                log.warning(
+                    f"Cell with {n_genes} genes < {N} in collate (should not happen). Skipping."
+                )
+                continue
+
+            # Randomly select N genes and shuffle
+            perm = np.random.permutation(n_genes)[:N]
+            selected_ids = gene_ids[perm]
+            selected_vals = vals[perm]
+
+            all_indices.append(torch.from_numpy(selected_ids.copy()))
+            all_values.append(torch.from_numpy(selected_vals.copy()).float())
+
+        if not all_indices:
+            return {
+                "indices": torch.empty(0, N, dtype=torch.long),
+                "values": torch.empty(0, N, dtype=torch.float),
+                "metadata": [],
+            }
+
+        indices = torch.stack(all_indices)  # [B, N]
+        values = torch.stack(all_values)    # [B, N]
+
+        # z-score standardization
+        values = (values - self.global_mean) / (self.global_std + 1e-6)
+
+        return {
+            "indices": indices,
+            "values": values,
+            "metadata": [{} for _ in valid_indices],
+        }
+
+    def _get_collate_fn(self):
+        if self.encoder_type == "transformer":
+            return self._collate_fn_transformer
+        return self._collate_fn
+
     def train_dataloader(self) -> DataLoader:
         sampler = None
         shuffle = True
@@ -294,7 +365,7 @@ class MemmapDataModule(L.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=shuffle,
             sampler=sampler,
-            collate_fn=self._collate_fn,
+            collate_fn=self._get_collate_fn(),
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
             persistent_workers=self.num_workers > 0,
@@ -311,7 +382,7 @@ class MemmapDataModule(L.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             sampler=sampler,
-            collate_fn=self._collate_fn,
+            collate_fn=self._get_collate_fn(),
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
             persistent_workers=self.num_workers > 0,
