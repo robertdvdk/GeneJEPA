@@ -20,10 +20,13 @@ hf_data_cache/
 Geneformer/
 eval/
 data_hlca/
-data/
 BioLLM/
 bench/
 weights/
 
 # Virtual environments
 .venv
+
+DATA/*
+logs/*
+checkpoints/*

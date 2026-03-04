@@ -266,7 +266,7 @@ class GenePerceiverJEPA(nn.Module):
             self.student_encoder,
             beta=config.ema_start_decay,
             update_every=1,
-            update_after_step=config.ema_warmup_steps
+            update_after_step=0
         )
 
         self.predictor = MLPPredictor(config)

@@ -4,10 +4,10 @@ from typing import Optional, Tuple
 
 @dataclass
 class ModelConfig:
-    d: int = 768
-    latents_L: int = 512
-    blocks_D: int = 24
-    heads_h: int = 12
+    d: int = 384
+    latents_L: int = 256
+    blocks_D: int = 12
+    heads_h: int = 6
     cross_attn_chunk_size: int = 32
     gene_vocab_size: int = 60_000  # filled later from datamodule
 
@@ -20,7 +20,7 @@ class ModelConfig:
     # --- EMA (slower, with warmup) ---
     ema_start_decay: float = 0.992
     ema_end_decay: float = 0.9995
-    ema_warmup_steps: int = 2000
+    ema_warmup_epochs: int = 1
 
     # Tokenizer
     identity_value_split_ratio: float = 0.5
@@ -44,14 +44,14 @@ class TrainingConfig:
     weight_decay: float = 2e-4
     warmup_ratio: float = 0.05
     max_epochs: int = 50
-    accumulate_grad_batches: int = 2
+    accumulate_grad_batches: int = 1
     gradient_clip_val: float = 1.0
     adam_betas: Tuple[float, float] = (0.9, 0.98)
 
 
 @dataclass
 class DataConfig:
-    batch_size: int = 92
+    batch_size: int = 128
     num_workers: int = 8
     train_samples: int = 1_000_000
     val_samples: int = 10_000

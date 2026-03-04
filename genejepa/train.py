@@ -171,8 +171,8 @@ class JepaLightningModule(L.LightningModule):
             val_norm = val_sq ** 0.5
 
             # Log to Lightning (and W&B if enabled)
-            self.log("debug/grad_norm_identity", id_norm, on_step=True, prog_bar=False, sync_dist=True)
-            self.log("debug/grad_norm_value",    val_norm, on_step=True, prog_bar=False, sync_dist=True)
+            self.log("train/grad_norm_identity", id_norm, on_step=True, prog_bar=False, sync_dist=True)
+            self.log("train/grad_norm_value",    val_norm, on_step=True, prog_bar=False, sync_dist=True)
 
             # Occasional human-readable print on rank 0
             if (self.global_step % 50 == 0) and self.trainer.is_global_zero:
@@ -279,7 +279,7 @@ class JepaLightningModule(L.LightningModule):
             self.log_dict(
                 {
                     "train/loss": zero,
-                    "train_loss/sim": zero,
+                    "train/sim_loss": zero,
                 },
                 on_step=True, on_epoch=False, prog_bar=True, sync_dist=True
             )
@@ -288,10 +288,10 @@ class JepaLightningModule(L.LightningModule):
             if self.global_step % 20 == 0:
                 self.log_dict(
                     {
-                        "train_quality/avg_cosine_pred": zero,
-                        "train_quality/norm_std_pred": zero,
-                        "train_quality/avg_cosine_tgt_precenter": zero,
-                        "train_quality/norm_std_tgt_precenter": zero,
+                        "train/avg_cosine_pred": zero,
+                        "train/norm_std_pred": zero,
+                        "train/avg_cosine_tgt_precenter": zero,
+                        "train/norm_std_tgt_precenter": zero,
                     },
                     on_step=True, on_epoch=False, sync_dist=True
                 )
@@ -317,12 +317,12 @@ class JepaLightningModule(L.LightningModule):
         if "teacher_avg_cos_targets" in cache:
             # Log locally on rank 0 only; avoid distributed reduction on conditional keys
             self.log(
-                "debug/teacher_avg_cos_on_targets",
+                "train/teacher_avg_cos",
                 float(cache["teacher_avg_cos_targets"]),
                 on_step=True, prog_bar=False, sync_dist=False, rank_zero_only=True
             )
             self.log(
-                "debug/teacher_stdnorm_on_targets",
+                "train/teacher_stdnorm",
                 float(cache["teacher_stdnorm_targets"]),
                 on_step=True, prog_bar=False, sync_dist=False, rank_zero_only=True
             )
@@ -336,15 +336,15 @@ class JepaLightningModule(L.LightningModule):
         )
 
         self.log_dict(
-            {"train/loss": total_loss, "train_loss/sim": sim_loss},
+            {"train/loss": total_loss, "train/sim_loss": sim_loss},
             on_step=True, on_epoch=False, prog_bar=True, sync_dist=True
         )
 
         # Student diagnostics
         avg_cos_s, std_s = self._collapse_metrics(student_ctx.detach())
         self.log_dict({
-            "train_quality/avg_cosine_student_ctx": avg_cos_s,
-            "train_quality/norm_std_student_ctx":   std_s,
+            "train/avg_cosine_student_ctx": avg_cos_s,
+            "train/norm_std_student_ctx":   std_s,
         }, on_step=True, prog_bar=False)
 
         # ---------- Diagnostics (every ~20 steps) ----------
@@ -355,10 +355,10 @@ class JepaLightningModule(L.LightningModule):
             avg_cos_t_pre, std_t_pre = self._collapse_metrics(target_raw.detach())
 
             logs = {
-                "train_quality/avg_cosine_pred": avg_cos_p,
-                "train_quality/norm_std_pred":   std_p,
-                "train_quality/avg_cosine_tgt_precenter": avg_cos_t_pre,
-                "train_quality/norm_std_tgt_precenter":   std_t_pre,
+                "train/avg_cosine_pred": avg_cos_p,
+                "train/norm_std_pred":   std_p,
+                "train/avg_cosine_tgt_precenter": avg_cos_t_pre,
+                "train/norm_std_tgt_precenter":   std_t_pre,
             }
 
             self.log_dict(logs, on_step=True, on_epoch=False, sync_dist=True)
@@ -367,7 +367,7 @@ class JepaLightningModule(L.LightningModule):
             lin0 = self.model.predictor.head[1]  # first Linear after LayerNorm
             w = lin0.weight.detach()
             self.log_dict({
-                "debug/pred_w_norm_input_cols": w.norm().item(),
+                "train/pred_w_norm": w.norm().item(),
             }, on_step=True, prog_bar=False, sync_dist=True)
         except Exception:
             pass
@@ -389,14 +389,7 @@ class JepaLightningModule(L.LightningModule):
         if pred.numel() == 0 or target.numel() == 0:
             # Log zeros so all ranks emit the same metric keys for the epoch reduction
             zero = torch.tensor(0.0, device=self.device)
-            self.log_dict(
-                {
-                    "val/loss": zero,
-                    "val_loss": zero,        # checkpoint monitor
-                    "val_loss/sim": zero,
-                },
-                on_step=False, on_epoch=True, sync_dist=True
-            )
+            self.log("val/loss", zero, on_step=False, on_epoch=True, sync_dist=True)
             return
 
         # No centering in validation
@@ -405,14 +398,7 @@ class JepaLightningModule(L.LightningModule):
 
         # BYOL-style cosine loss for validation
         val_sim = self._cosine_loss(pred, target.detach())
-        self.log_dict(
-            {
-                "val/loss": val_sim,
-                "val_loss": val_sim,  # checkpoint monitor
-                "val_loss/sim": val_sim,
-            },
-            on_step=False, on_epoch=True, sync_dist=True
-        )
+        self.log("val/loss", val_sim, on_step=False, on_epoch=True, sync_dist=True)
         
     def on_train_batch_start(self, batch: Any, batch_idx: int):
         if self.total_steps > 0:
@@ -422,7 +408,7 @@ class JepaLightningModule(L.LightningModule):
                     (ema_end - self.hparams.model_config.ema_start_decay) * \
                     (math.cos(math.pi * progress) + 1) / 2
             self.model.teacher_encoder.beta = decay
-            self.log("hyper/ema_decay", decay, on_step=True, on_epoch=False, rank_zero_only=True)
+            self.log("schedule/ema_decay", decay, on_step=True, on_epoch=False, rank_zero_only=True)
 
     def on_train_batch_end(self, outputs: Dict[str, Any], batch: Any, batch_idx: int):
         if (not self.did_initial_teacher_sync.item()) and (self.global_step == 0):
@@ -436,7 +422,7 @@ class JepaLightningModule(L.LightningModule):
             self.did_initial_teacher_sync.fill_(True)
 
         # --- EMA warmup gate ---
-        if self.global_step >= self.hparams.model_config.ema_warmup_steps:
+        if self.current_epoch >= self.hparams.model_config.ema_warmup_epochs:
             with torch.no_grad():
                 self.model.update_teacher()
 
@@ -534,6 +520,7 @@ class JepaLightningModule(L.LightningModule):
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "interval": "step",
+                "name": "schedule/lr",
             },
         }
 
@@ -781,12 +768,12 @@ if __name__ == "__main__":
     log.info(f"Checkpoints directory: {exp_config.checkpoint_dir}")
     callbacks: List[Callback] = [
         ModelCheckpoint(
-            dirpath=exp_config.checkpoint_dir, 
-            monitor="val_loss",
-            save_top_k=2, 
-            mode="min", 
+            dirpath=exp_config.checkpoint_dir,
+            monitor="val/loss",
+            save_top_k=2,
+            mode="min",
             save_last=True,
-            filename='scjepa-{epoch:02d}-{val_loss:.3f}'
+            filename='scjepa-{epoch:02d}-{val/loss:.3f}'
         ),
         LearningRateMonitor(logging_interval="step")
     ]

@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -114,8 +115,6 @@ class EmbeddingQualityValidator(Callback):
         if trainer.global_rank == 0 and embeddings_tensor.numel() > 0:
             log.info(f"Processing {embeddings_tensor.shape[0]} collected embeddings on rank 0...")
             self._log_collapse_metrics(embeddings_tensor, pl_module)
-            if rank_0_embeddings.numel() > 0 and (trainer.current_epoch + 1) % self.plot_every_n_epochs == 0:
-                self._log_umap_plot(rank_0_embeddings, local_metadata, pl_module)
                 
         # STEP 4: All processes must wait here to stay in sync.
         if world_size > 1:
@@ -136,14 +135,14 @@ class EmbeddingQualityValidator(Callback):
         if wandb and wandb.run:
             try:
                 wandb.log({
-                    "val_quality/cosine_hist": wandb.Histogram(sim_matrix.detach().flatten().cpu().numpy()),
-                    "val_quality/embedding_norms_hist": wandb.Histogram(torch.linalg.norm(embeddings_f32, dim=1).detach().cpu().numpy()),
+                    "val/cosine_hist": wandb.Histogram(sim_matrix.detach().flatten().cpu().numpy()),
+                    "val/embedding_norms_hist": wandb.Histogram(torch.linalg.norm(embeddings_f32, dim=1).detach().cpu().numpy()),
                 })
             except Exception as _e:
                 pass  # stay silent if histogram creation fails on edge cases
 
         pl_module.log_dict(
-            {"val_quality/avg_cosine_sim": avg_cosine_sim.item(), "val_quality/output_norm_std": output_norm_std.item()},
+            {"val/avg_cosine_sim": avg_cosine_sim.item(), "val/output_norm_std": output_norm_std.item()},
             on_step=False, on_epoch=True, rank_zero_only=True
         )
 
@@ -523,4 +522,399 @@ class SupervisedValidatorCallback(Callback):
             accuracy = correct / len(val_labels) if len(val_labels) > 0 else 0.0
         
         log.info(f"[Probe Validator] Probe validation accuracy: {accuracy:.4f}")
-        pl_module.log("val_probe/accuracy", accuracy, on_step=False, on_epoch=True, rank_zero_only=True)
+        pl_module.log("val/probe_accuracy", accuracy, on_step=False, on_epoch=True, rank_zero_only=True)
+
+
+class _SubsetByIndices(torch.utils.data.Dataset):
+    """Wraps a dataset and exposes only the rows at the given original indices."""
+
+    def __init__(self, dataset, indices):
+        self.dataset = dataset
+        self.indices = indices
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        return self.dataset[self.indices[idx]]
+
+
+class _ListDataset(torch.utils.data.Dataset):
+    """Simple wrapper around a list of dicts."""
+
+    def __init__(self, records):
+        self.records = records
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        return self.records[idx]
+
+
+class ScibMetricsCallback(Callback):
+    """
+    Computes scib-metrics (silhouette, NMI, ARI) on validation embeddings.
+
+    - Every epoch: on the memmap validation set
+    - Every N epochs: on an external Neftel h5ad dataset
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        neftel_h5ad_path: str,
+        global_mean: float,
+        global_std: float,
+        val_dataset,
+        batch_size: int = 256,
+        max_cells: int = 5000,
+        neftel_every_n_epochs: int = 5,
+        val_batch_key: str = "technology",
+        val_label_key: str = "cancer_type",
+        neftel_batch_key: str = "sample",
+        neftel_label_key: str = "subtype",
+    ):
+        super().__init__()
+        self.data_dir = data_dir
+        self.neftel_h5ad_path = neftel_h5ad_path
+        self.global_mean = global_mean
+        self.global_std = global_std
+        self.val_dataset = val_dataset
+        self.batch_size = batch_size
+        self.max_cells = max_cells
+        self.neftel_every_n_epochs = neftel_every_n_epochs
+        self.val_batch_key = val_batch_key
+        self.val_label_key = val_label_key
+        self.neftel_batch_key = neftel_batch_key
+        self.neftel_label_key = neftel_label_key
+
+        self._initialized = False
+        self._val_loader = None
+        self._val_labels = None
+        self._val_batch = None
+        self._neftel_loader = None
+        self._neftel_labels = None
+        self._neftel_batch = None
+
+        log.info("ScibMetricsCallback initialized.")
+
+    def _initialize(self):
+        """Lazy init: build data loaders and label arrays (rank 0 only)."""
+        self._initialized = True
+        self._init_val_data()
+        self._init_neftel_data()
+
+    # ------------------------------------------------------------------
+    # Memmap validation data
+    # ------------------------------------------------------------------
+    def _init_val_data(self):
+        import json
+        from pathlib import Path
+
+        data_dir = Path(self.data_dir)
+        obs = pd.read_parquet(data_dir / "obs.parquet")
+
+        # val_dataset may be nested Subsets (e.g. subset of val split).
+        # Resolve through all layers to get indices into the root dataset.
+        from torch.utils.data import Subset
+        ds = self.val_dataset
+        original_indices = np.arange(len(ds))
+        while isinstance(ds, Subset):
+            original_indices = np.array(ds.indices)[original_indices]
+            ds = ds.dataset
+        underlying_dataset = ds  # the root MemmapCellDataset
+
+        # Subsample if needed
+        rng = np.random.default_rng(42)
+        if len(original_indices) > self.max_cells:
+            sel = rng.choice(len(original_indices), size=self.max_cells, replace=False)
+            original_indices = original_indices[sel]
+
+        # Look up batch/label from obs using original indices
+        if self.val_label_key in obs.columns:
+            labels_raw = obs[self.val_label_key].values[original_indices]
+            _, self._val_labels = np.unique(labels_raw, return_inverse=True)
+        else:
+            log.warning(f"[ScibMetrics] val label column '{self.val_label_key}' not found in obs.parquet. Skipping val labels.")
+            self._val_labels = None
+
+        if self.val_batch_key in obs.columns:
+            batch_raw = obs[self.val_batch_key].values[original_indices]
+            _, self._val_batch = np.unique(batch_raw, return_inverse=True)
+        else:
+            log.warning(f"[ScibMetrics] val batch column '{self.val_batch_key}' not found in obs.parquet. Skipping val batch.")
+            self._val_batch = None
+
+        # Build DataLoader wrapping the root dataset
+        subset_ds = _SubsetByIndices(underlying_dataset, original_indices)
+        self._val_loader = DataLoader(
+            subset_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            collate_fn=self._collate_fn,
+            num_workers=0,
+        )
+        log.info(f"[ScibMetrics] Val data ready: {len(original_indices)} cells")
+
+    # ------------------------------------------------------------------
+    # Neftel external data
+    # ------------------------------------------------------------------
+    def _init_neftel_data(self):
+        import json
+        import anndata as ad
+        from pathlib import Path
+
+        if not os.path.isfile(self.neftel_h5ad_path):
+            log.warning(f"[ScibMetrics] Neftel file not found: {self.neftel_h5ad_path}. Skipping Neftel eval.")
+            return
+
+        # Load vocab
+        data_dir = Path(self.data_dir)
+        with open(data_dir / "vocab.json", "r") as f:
+            vocab = json.load(f)
+
+        # Build case-insensitive vocab lookup (skip special tokens)
+        special = {"<cls>", "<pad>"}
+        vocab_upper = {}
+        for sym, idx in vocab.items():
+            if sym in special:
+                continue
+            vocab_upper[sym.upper()] = idx
+
+        # Load h5ad
+        adata = ad.read_h5ad(self.neftel_h5ad_path)
+        log.info(f"[ScibMetrics] Loaded Neftel h5ad: {adata.n_obs} cells, {adata.n_vars} genes")
+
+        # Match var_names to vocab
+        import scipy.sparse as sp
+
+        matched_vocab_indices = []  # vocab token IDs
+        matched_var_cols = []       # column indices in adata.X
+        for col_idx, var_name in enumerate(adata.var_names):
+            token_id = vocab_upper.get(var_name.upper())
+            if token_id is not None:
+                matched_vocab_indices.append(token_id)
+                matched_var_cols.append(col_idx)
+
+        log.info(f"[ScibMetrics] Matched {len(matched_vocab_indices)} genes between Neftel and vocab")
+
+        if len(matched_vocab_indices) == 0:
+            log.warning("[ScibMetrics] No gene overlap with Neftel. Skipping Neftel eval.")
+            return
+
+        matched_vocab_indices = np.array(matched_vocab_indices, dtype=np.int64)
+        matched_var_cols = np.array(matched_var_cols)
+
+        # Subsample cells
+        rng = np.random.default_rng(42)
+        n_cells = adata.n_obs
+        if n_cells > self.max_cells:
+            sel = np.sort(rng.choice(n_cells, size=self.max_cells, replace=False))
+        else:
+            sel = np.arange(n_cells)
+
+        # Extract expression for matched genes
+        X_sub = adata.X[sel][:, matched_var_cols]
+        if sp.issparse(X_sub):
+            X_sub = X_sub.toarray()
+        X_sub = np.asarray(X_sub, dtype=np.float32)
+
+        # Build records
+        records = []
+        for i in range(X_sub.shape[0]):
+            row = X_sub[i]
+            nonzero = row != 0
+            if nonzero.any():
+                records.append({
+                    "gene_indices": matched_vocab_indices[nonzero].copy(),
+                    "values": row[nonzero].copy(),
+                })
+            else:
+                records.append({
+                    "gene_indices": np.array([], dtype=np.int64),
+                    "values": np.array([], dtype=np.float32),
+                })
+
+        # Labels and batch
+        if self.neftel_label_key in adata.obs.columns:
+            labels_raw = adata.obs[self.neftel_label_key].values[sel]
+            _, self._neftel_labels = np.unique(labels_raw, return_inverse=True)
+        else:
+            log.warning(f"[ScibMetrics] Neftel label column '{self.neftel_label_key}' not found. Skipping labels.")
+            self._neftel_labels = None
+
+        if self.neftel_batch_key in adata.obs.columns:
+            batch_raw = adata.obs[self.neftel_batch_key].values[sel]
+            _, self._neftel_batch = np.unique(batch_raw, return_inverse=True)
+        else:
+            log.warning(f"[ScibMetrics] Neftel batch column '{self.neftel_batch_key}' not found. Skipping batch.")
+            self._neftel_batch = None
+
+        self._neftel_loader = DataLoader(
+            _ListDataset(records),
+            batch_size=self.batch_size,
+            shuffle=False,
+            collate_fn=self._collate_fn,
+            num_workers=0,
+        )
+        log.info(f"[ScibMetrics] Neftel data ready: {len(records)} cells")
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+    def _collate_fn(self, batch):
+        indices = torch.cat([torch.from_numpy(s["gene_indices"]) for s in batch])
+        values = torch.cat([torch.from_numpy(s["values"]) for s in batch]).float()
+        values = (values - self.global_mean) / (self.global_std + 1e-6)
+        offsets = torch.tensor(
+            [0] + [len(s["gene_indices"]) for s in batch], dtype=torch.long
+        ).cumsum(0)
+        return {"indices": indices, "values": values, "offsets": offsets}
+
+    @torch.no_grad()
+    def _compute_embeddings(self, loader, pl_module):
+        all_emb = []
+        pl_module.eval()
+        for batch in loader:
+            emb = pl_module.model.get_embedding(
+                batch["indices"].to(pl_module.device),
+                batch["values"].to(pl_module.device),
+                batch["offsets"].to(pl_module.device),
+                use_teacher=True,
+            )
+            all_emb.append(emb.cpu().numpy())
+        pl_module.train()
+        return np.concatenate(all_emb, axis=0)
+
+    def _compute_and_log_metrics(self, embeddings, labels, batch_arr, prefix, pl_module, label_name="label", batch_name="batch"):
+        import anndata as ad
+        from scib_metrics.benchmark import Benchmarker, BioConservation, BatchCorrection
+
+        n_unique_labels = len(np.unique(labels)) if labels is not None else 0
+        n_unique_batch = len(np.unique(batch_arr)) if batch_arr is not None else 0
+        if labels is None or n_unique_labels <= 1:
+            log.info(f"[ScibMetrics] Skipping {prefix} (n_unique_labels={n_unique_labels})")
+            return
+        if batch_arr is None or n_unique_batch <= 1:
+            log.info(f"[ScibMetrics] Skipping batch metrics for {prefix} (n_unique_batch={n_unique_batch})")
+
+        emb_key = "X_emb"
+        adata = ad.AnnData(
+            X=embeddings.copy(),
+            obsm={emb_key: embeddings},
+        )
+        adata.obs["label"] = pd.Categorical([str(x) for x in labels])
+        has_batch = batch_arr is not None and n_unique_batch > 1
+        if has_batch:
+            adata.obs["batch"] = pd.Categorical([str(x) for x in batch_arr])
+
+        bm = Benchmarker(
+            adata,
+            batch_key="batch" if has_batch else "label",
+            label_key="label",
+            embedding_obsm_keys=[emb_key],
+            bio_conservation_metrics=BioConservation(
+                nmi_ari_cluster_labels_leiden=True,
+                nmi_ari_cluster_labels_kmeans=True,
+            ),
+            batch_correction_metrics=BatchCorrection() if has_batch else None,
+            n_jobs=1,
+        )
+        bm.benchmark()
+        df = bm.get_results(min_max_scale=False)
+
+        # Log only aggregate scores
+        row = df.loc[emb_key]
+        aggregate_keys = ["Bio conservation", "Batch correction", "Total"]
+        metrics = {}
+        for col in aggregate_keys:
+            if col in row.index and pd.notna(row[col]):
+                key = col.lower().replace(" ", "_")
+                metrics[f"{prefix}/{key}"] = float(row[col])
+
+        if metrics:
+            pl_module.log_dict(metrics, on_step=False, on_epoch=True, rank_zero_only=True)
+        log.info(f"[ScibMetrics] {prefix}:\n{df.to_string()}")
+
+        # UMAP colored by label and batch
+        self._log_umap(embeddings, labels, batch_arr, prefix, pl_module, label_name, batch_name)
+
+    def _log_umap(self, embeddings, labels, batch_arr, prefix, pl_module, label_name="label", batch_name="batch"):
+        if not wandb or not wandb.run:
+            return
+        import scanpy as sc
+        import anndata as ad
+
+        max_points = 5_000
+        n = len(embeddings)
+        if n > max_points:
+            sel = np.random.default_rng(42).choice(n, size=max_points, replace=False)
+            embeddings = embeddings[sel]
+            labels = labels[sel] if labels is not None else None
+            batch_arr = batch_arr[sel] if batch_arr is not None else None
+
+        # Build AnnData with embeddings in obsm
+        adata = ad.AnnData(X=embeddings.copy(), obsm={"X_emb": embeddings})
+        if labels is not None:
+            adata.obs[label_name] = pd.Categorical([str(x) for x in labels])
+        if batch_arr is not None:
+            adata.obs[batch_name] = pd.Categorical([str(x) for x in batch_arr])
+
+        # scanpy UMAP pipeline on pre-computed embeddings
+        sc.pp.neighbors(adata, use_rep="X_emb", n_neighbors=15)
+        sc.tl.umap(adata, random_state=42)
+
+        # Collect which keys to plot
+        color_keys = []
+        titles = []
+        for key, arr in [(label_name, labels), (batch_name, batch_arr)]:
+            if arr is not None and key in adata.obs:
+                color_keys.append(key)
+                titles.append(f"{prefix} — {key} (epoch {pl_module.current_epoch})")
+
+        if not color_keys:
+            return
+
+        try:
+            import io
+            # Consistent dot size regardless of n_obs
+            fig = sc.pl.umap(adata, color=color_keys, title=titles, size=8,
+                             ncols=len(color_keys), show=False, return_fig=True)
+            # Save to buffer with bbox_inches='tight' so external legends
+            # are fully captured, and high DPI so the image isn't tiny in W&B.
+            from PIL import Image as PILImage
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+            buf.seek(0)
+            img = PILImage.open(buf)
+            wandb.log({f"{prefix}/umap": wandb.Image(img)}, step=pl_module.global_step)
+            plt.close(fig)
+        except Exception as e:
+            log.warning(f"[ScibMetrics] UMAP plot failed for {prefix}: {e}")
+
+    # ------------------------------------------------------------------
+    # Main hook
+    # ------------------------------------------------------------------
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        if not trainer.is_global_zero:
+            return
+
+        if not self._initialized:
+            self._initialize()
+
+        # Every epoch: val metrics
+        if self._val_loader is not None:
+            log.info(f"[ScibMetrics] Computing val metrics (epoch {trainer.current_epoch})...")
+            emb = self._compute_embeddings(self._val_loader, pl_module)
+            self._compute_and_log_metrics(emb, self._val_labels, self._val_batch, "scib/val", pl_module,
+                                         label_name=self.val_label_key, batch_name=self.val_batch_key)
+
+        # Every N epochs: Neftel metrics
+        if self._neftel_loader is not None and (trainer.current_epoch + 1) % self.neftel_every_n_epochs == 0:
+            log.info(f"[ScibMetrics] Computing Neftel metrics (epoch {trainer.current_epoch})...")
+            emb = self._compute_embeddings(self._neftel_loader, pl_module)
+            self._compute_and_log_metrics(emb, self._neftel_labels, self._neftel_batch, "scib/neftel", pl_module,
+                                         label_name=self.neftel_label_key, batch_name=self.neftel_batch_key)
